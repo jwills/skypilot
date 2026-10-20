@@ -1771,6 +1771,122 @@ class EagerFailoverStrategyExecutor(FailoverStrategyExecutor):
             return job_submitted_at
 
 
+@registry.JOBS_RECOVERY_STRATEGY_REGISTRY.type_register(name='ELASTIC',
+                                                        default=False)
+class ElasticStrategyExecutor(EagerFailoverStrategyExecutor):
+    """Elastic strategy: launch on the largest node count available.
+
+    The task's ``job_recovery`` lists the node counts the job can run on, in
+    descending order, starting with the task's ``num_nodes``:
+
+        num_nodes: 4
+        resources:
+          job_recovery:
+            strategy: ELASTIC
+            node_counts: [4, 2, 1]
+
+    On the first launch and on every recovery, each node count is tried in
+    turn, and each attempt fails over through the whole candidate search
+    space (clouds, regions, any_of/ordered resources) before the next,
+    smaller count is tried. A job that shrank therefore grows back to the
+    largest count at its next recovery.
+
+    The job must be able to resume on a different number of nodes, e.g. by
+    deriving its parallelism from SKYPILOT_NUM_NODES and restoring from a
+    checkpoint that can be resharded.
+    """
+
+    def set_strategy_config(self, config: dict) -> None:
+        config = dict(config)
+        node_counts = config.pop('node_counts', None)
+        super().set_strategy_config(config)
+        task = self.dag.tasks[0]
+        if node_counts is None:
+            raise ValueError('The ELASTIC job recovery strategy requires '
+                             '`node_counts`, e.g. node_counts: [4, 2, 1].')
+        if (not isinstance(node_counts, list) or not node_counts or
+                not all(isinstance(n, int) and n > 0 for n in node_counts)):
+            raise ValueError('`node_counts` must be a non-empty list of '
+                             f'positive integers, got {node_counts!r}.')
+        if any(a <= b for a, b in zip(node_counts, node_counts[1:])):
+            raise ValueError('`node_counts` must be strictly descending, got '
+                             f'{node_counts}.')
+        if node_counts[0] != task.num_nodes:
+            raise ValueError(
+                f'The first entry of `node_counts` ({node_counts[0]}) must '
+                f'equal the task\'s num_nodes ({task.num_nodes}).')
+        if self.pool is not None:
+            raise ValueError('The ELASTIC job recovery strategy is not '
+                             'supported for jobs submitted to a pool.')
+        self._node_counts: List[int] = node_counts
+
+    async def on_resume(self, cluster_name: str) -> None:
+        await super().on_resume(cluster_name)
+        # The controller restarted while the job was running. The task was
+        # re-parsed from the submitted YAML, so it carries the submitted
+        # num_nodes; restore the node count the cluster actually has.
+        handle = await asyncio.to_thread(
+            global_user_state.get_handle_from_cluster_name, cluster_name)
+        if isinstance(handle, backends.CloudVmRayResourceHandle):
+            self.dag.tasks[0].num_nodes = handle.launched_nodes
+            logger.info('ELASTIC: resumed monitoring a cluster with '
+                        f'{handle.launched_nodes} node(s).')
+
+    async def launch(self) -> float:
+        return await self._launch_elastic(recovery=False)
+
+    async def recover(self) -> float:
+        await asyncio.to_thread(self._cleanup_cluster)
+        return await self._launch_elastic(recovery=True)
+
+    async def _launch_elastic(self, recovery: bool) -> float:
+        """Launches on the first node count that can be provisioned.
+
+        Each node count gets one launch attempt (which itself fails over
+        through all candidate resources). If every count fails for lack of
+        capacity, backs off and starts over from the largest count.
+
+        Raises:
+            exceptions.ProvisionPrechecksError: if every node count fails
+                before provisioning, i.e. the job can never be launched.
+        """
+        task = self.dag.tasks[0]
+        backoff = common_utils.Backoff(self.RETRY_INIT_GAP_SECONDS)
+        while True:
+            precheck_errors: List[exceptions.ProvisionPrechecksError] = []
+            for num_nodes in self._node_counts:
+                task.num_nodes = num_nodes
+                logger.info(f'ELASTIC: trying to launch with {num_nodes} '
+                            f'node(s) (preference: {self._node_counts}).')
+                try:
+                    job_submitted_at = await self._launch(max_retry=1,
+                                                          recovery=recovery)
+                except exceptions.ProvisionPrechecksError as e:
+                    # This node count cannot be provisioned anywhere.
+                    logger.info(f'ELASTIC: {num_nodes} node(s) failed '
+                                'prechecks: '
+                                f'{common_utils.format_exception(e)}')
+                    precheck_errors.append(e)
+                    continue
+                except exceptions.ManagedJobReachedMaxRetriesError:
+                    logger.info(f'ELASTIC: no capacity for {num_nodes} '
+                                'node(s).')
+                    continue
+                assert job_submitted_at is not None
+                logger.info(f'ELASTIC: launched with {num_nodes} of '
+                            f'{self._node_counts[0]} node(s).')
+                return job_submitted_at
+            if len(precheck_errors) == len(self._node_counts):
+                raise exceptions.ProvisionPrechecksError(reasons=[
+                    reason for e in precheck_errors for reason in e.reasons
+                ])
+            gap_seconds = backoff.current_backoff()
+            logger.info('ELASTIC: no node count could be launched; retrying '
+                        f'from {self._node_counts[0]} node(s) in '
+                        f'{gap_seconds:.1f} seconds.')
+            await asyncio.sleep(gap_seconds)
+
+
 def _get_logger_file(file_logger: logging.Logger) -> Optional[str]:
     """Gets the file path that the logger writes to."""
     for handler in file_logger.handlers:

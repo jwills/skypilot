@@ -422,6 +422,17 @@ def _get_single_resources_schema():
                                     },
                                 ],
                             },
+                            # Node counts to try, largest first, for the
+                            # ELASTIC strategy.
+                            'node_counts': {
+                                'type': 'array',
+                                'items': {
+                                    'type': 'integer',
+                                    'minimum': 1,
+                                },
+                                'minItems': 1,
+                                'uniqueItems': True,
+                            },
                             # Plugin-registered strategy-specific
                             # properties (validated on server side
                             # where plugins are loaded).
